@@ -5,8 +5,9 @@ Handles all communication between the Streamlit dashboard and the
 Raspberry Pi controller (per Chapter 3 methodology):
 
   - Sends "START\n" / "STOP\n" / "CALIBRATE\n" / "SPD1\n" / "SPD2\n" /
-    "SPD3\n" to the Pi over USB serial at 9600 baud when the operator
-    uses the dashboard controls.
+    "SPD3\n" / "SERVO50\n" / "SERVO100\n" / "SERVO150\n" / "SERVO180\n"
+    to the Pi over USB serial at 9600 baud when the operator uses the
+    dashboard controls.
   - Listens for lines coming back from the Pi / vision script and
     updates live counters + machine status.
 
@@ -22,6 +23,8 @@ partners so their code matches):
     STATUS:FAULT         -> sets machine status to Fault (the Pi/ESP
                             entered this on its own, e.g. a FIFO
                             overflow — not something the dashboard asked for)
+    DIVERTER:READY       -> sets the reject servo's own state to Ready
+    DIVERTER:DIVERTING   -> sets the reject servo's own state to Diverting
 
 If your partners send a different format, only _process_line() below
 needs to change - the rest of the dashboard doesn't care.
@@ -56,6 +59,7 @@ class SerialBridge:
         self.good_count = 0
         self.bad_count = 0
         self.machine_status = "Idle"
+        self.diverter_state = "Ready"
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -121,9 +125,14 @@ class SerialBridge:
                     self.machine_status = status_map[status]
                 # an unrecognized value leaves machine_status unchanged rather
                 # than guessing
+            elif line.startswith("DIVERTER:"):
+                diverter = line.split(":", 1)[1].strip().upper()
+                diverter_map = {"READY": "Ready", "DIVERTING": "Diverting"}
+                if diverter in diverter_map:
+                    self.diverter_state = diverter_map[diverter]
 
     def send_command(self, cmd: str) -> bool:
-        """Send START / STOP / CALIBRATE / SPD1 / SPD2 / SPD3 to the Pi."""
+        """Send START / STOP / CALIBRATE / SPD1-3 / SERVO50-180 to the Pi."""
         if not (self.connected and self.ser):
             return False
         try:
@@ -157,6 +166,7 @@ class SerialBridge:
                 "good": self.good_count,
                 "bad": self.bad_count,
                 "status": self.machine_status,
+                "diverter": self.diverter_state,
                 "connected": self.connected,
                 "error": self.error,
                 "camera_frame": None,
@@ -177,6 +187,7 @@ class SimulationBridge:
         self.good_count = 0
         self.bad_count = 0
         self.machine_status = "Idle"
+        self.diverter_state = "Ready"
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
@@ -191,12 +202,19 @@ class SimulationBridge:
     def _simulate_loop(self):
         while not self._stop_event.is_set():
             time.sleep(random.uniform(0.4, 1.2))
+            diverted = False
             with self._lock:
                 if self.machine_status == "Running":
                     if random.random() < 0.88:
                         self.good_count += 1
                     else:
                         self.bad_count += 1
+                        self.diverter_state = "Diverting"
+                        diverted = True
+            if diverted:
+                time.sleep(0.3)  # mirrors the real servo's hold time
+                with self._lock:
+                    self.diverter_state = "Ready"
 
     def send_command(self, cmd: str) -> bool:
         if cmd == "START":
@@ -205,7 +223,7 @@ class SimulationBridge:
             self.machine_status = "Idle"
         elif cmd == "CALIBRATE":
             self.machine_status = "Calibration"
-        # SPD1/SPD2/SPD3 have no simulated effect — accepted, no-op
+        # SPD1-3 and SERVO50-180 have no simulated effect — accepted, no-op
         return True
 
     def disconnect(self):
@@ -218,6 +236,7 @@ class SimulationBridge:
                 "good": self.good_count,
                 "bad": self.bad_count,
                 "status": self.machine_status,
+                "diverter": self.diverter_state,
                 "connected": self.connected,
                 "error": self.error,
                 "camera_frame": None,

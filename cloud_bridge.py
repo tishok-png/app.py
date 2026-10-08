@@ -14,7 +14,10 @@ Data stored in Firebase (all under one node, e.g. "seed_sorting"):
     bad            <int>            cumulative bad-seed count
     status         "Idle"/"Running"/"Calibration"/"Fault" - mirrors the
                    Pi/ESP's own reported state, not just what was requested
-    command        "START"/"STOP"/"CALIBRATE"/"SPD1"/"SPD2"/"SPD3"/""
+    diverter       "Ready"/"Diverting" - the reject servo's own state,
+                   independent of the machine status above
+    command        "START"/"STOP"/"CALIBRATE"/"SPD1"/"SPD2"/"SPD3"/
+                   "SERVO50"/"SERVO100"/"SERVO150"/"SERVO180"/""
                    <- dashboard writes, Pi reads + clears
     camera_frame   "<base64 jpeg>"     <- Pi writes, dashboard displays
     camera_ts      <unix timestamp>    <- when the frame was last updated
@@ -100,6 +103,7 @@ class CloudBridge:
                 "good": int(data.get("good", 0) or 0),
                 "bad": int(data.get("bad", 0) or 0),
                 "status": data.get("status", "Idle") or "Idle",
+                "diverter": data.get("diverter", "Ready") or "Ready",
                 "belt_speed": int(data.get("belt_speed", 1) or 1),
                 "connected": True,
                 "error": None,
@@ -110,7 +114,7 @@ class CloudBridge:
             self.connected = False
             self.error = f"Could not read from Firebase: {exc}"
             return {
-                "good": 0, "bad": 0, "status": "Idle", "belt_speed": 1,
+                "good": 0, "bad": 0, "status": "Idle", "diverter": "Ready", "belt_speed": 1,
                 "connected": False, "error": self.error,
                 "camera_frame": None, "camera_ts": None,
             }

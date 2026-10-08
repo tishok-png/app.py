@@ -60,8 +60,12 @@ GRAY_LIGHT = "#F1F0F5"
 TEXT_DARK = "#1F2430"
 TEXT_MUTED = "#8A8FA3"
 
-# Belt speed levels, in cm/s — must match BELT_SPEED_CM_S in sorter_esp8266.ino
-SPEED_LEVELS = [(1, 3.14), (2, 6.2), (3, 7.4)]
+# Belt speed levels shown on the buttons, in cm/s. These are the physically
+# MEASURED speeds (level 1 updated from measurement; 2 and 3 are still the
+# original computed estimates) — they label the buttons for the operator and
+# don't need to match the ESP's internal step-rate target exactly, only mean
+# the same level 1/2/3 as sorter_pi_agent.py's BELT_SPEED_CM_S_BY_LEVEL.
+SPEED_LEVELS = [(1, 3.75), (2, 6.2), (3, 7.4)]
 
 # Machine status -> (icon, card background, accent color). Idle/Running/
 # Calibration/Fault mirror the ESP's own reported state (see sorter_esp8266.ino).
@@ -394,11 +398,14 @@ with st.sidebar:
     st.divider()
     st.caption(
         "**USB protocol** — in: `0`/`1` (bad/good, per-seed) · `GOOD`/`BAD` · "
-        "`COUNTS:<g>,<b>` · `STATUS:IDLE/RUNNING/CALIBRATION/FAULT` — "
-        "out: `START`/`STOP`/`CALIBRATE`/`SPD1`/`SPD2`/`SPD3`\n\n"
+        "`COUNTS:<g>,<b>` · `STATUS:IDLE/RUNNING/CALIBRATION/FAULT` · "
+        "`DIVERTER:READY/DIVERTING` — out: `START`/`STOP`/`CALIBRATE`/"
+        "`SPD1`/`SPD2`/`SPD3`/`SERVO50`/`SERVO100`/`SERVO150`/`SERVO180`\n\n"
         "**Cloud protocol** — Firebase keys: `good`, `bad` (running totals), "
-        "`status` (Idle/Running/Calibration/Fault), `camera_frame`, `command`.\n\n"
-        "**Speed levels** — 3.14 / 6.2 / 7.4 cm/s."
+        "`status` (Idle/Running/Calibration/Fault), `diverter` (Ready/Diverting), "
+        "`camera_frame`, `command`.\n\n"
+        "**Speed levels** — 3.75 / 6.2 / 7.4 cm/s (level 1 is measured; "
+        "2 and 3 are still computed estimates)."
     )
 
 # --------------------------------------------------------------------------
@@ -421,10 +428,11 @@ with tab_live:
     def live_dashboard():
         bridge = st.session_state.bridge
         if bridge is None:
-            good, bad, status, cam_frame = 0, 0, "Idle", None
+            good, bad, status, diverter, cam_frame = 0, 0, "Idle", "Ready", None
         else:
             snap = bridge.get_snapshot()
             good, bad, status = snap["good"], snap["bad"], snap["status"]
+            diverter = snap.get("diverter", "Ready")
             cam_frame = snap.get("camera_frame")
 
         total = good + bad
@@ -441,7 +449,7 @@ with tab_live:
             })
 
         # ---- metrics row (matching stat-card style) ----
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
             icon, bg, color = STATUS_STYLE.get(status, STATUS_STYLE["Idle"])
             stat_card(
@@ -450,10 +458,18 @@ with tab_live:
                 value_color=color,
             )
         with col2:
-            stat_card("✅", GREEN_LIGHT, "Good Seeds", good)
+            # Diverter is independent of Machine Status — it's the servo's
+            # own moment-to-moment state, not the overall run state.
+            if diverter == "Diverting":
+                d_icon, d_bg, d_color = "🟡", BLUE_LIGHT, BLUE
+            else:
+                d_icon, d_bg, d_color = "⚪", GRAY_LIGHT, TEXT_MUTED
+            stat_card(d_icon, d_bg, "Diverter", diverter, value_color=d_color)
         with col3:
-            stat_card("❌", RED_LIGHT, "Bad / Defective", bad)
+            stat_card("✅", GREEN_LIGHT, "Good Seeds", good)
         with col4:
+            stat_card("❌", RED_LIGHT, "Bad / Defective", bad)
+        with col5:
             stat_card("🌽", PURPLE_LIGHT, "Total Counted", total)
 
         # ---- control row: progress bar + Start/Stop, right under the cards
@@ -526,6 +542,25 @@ with tab_live:
                         )
                     else:
                         st.error("Failed to send CALIBRATE command.")
+
+        # ---- third control row: manual servo-angle bring-up test, only
+        # meaningful (and only allowed on the Pi side) while Idle ----
+        st.caption("Servo bring-up test — moves the gate directly, bypassing the FIFO. Only works while Idle.")
+        servo_cols = st.columns(4)
+        servo_disabled = status != "Idle"
+        for col, angle in zip(servo_cols, (50, 100, 150, 180)):
+            with col:
+                if st.button(f"🔧 {angle}°", use_container_width=True,
+                             key=f"servo_{angle}", disabled=servo_disabled):
+                    bridge = st.session_state.bridge
+                    if bridge is None:
+                        st.error("Connect to the machine first (see sidebar).")
+                    else:
+                        ok = bridge.send_command(f"SERVO{angle}")
+                        if ok:
+                            st.toast(f"Servo moved to {angle}°", icon="🔧")
+                        else:
+                            st.error("Failed to send servo test command.")
 
         # ---- current-run chart, wrapped in one clean card (title + total +
         # legend on top, chart underneath) like the reference dashboard ----
