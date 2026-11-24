@@ -9,6 +9,11 @@ Dark theme dashboard:
   - Control panel (start / stop / belt speed / calibrate / servo AUTO-MANUAL)
   - Analytics cards (trend line, good-vs-bad bar, good rate)
   - History tab with per-session graphs and CSV downloads
+  - Sidebar: Cloud or WebSocket connection + Pi WiFi setup
+
+Two ways to talk to the Pi:
+  Cloud      Firebase, works from anywhere with internet (slower)
+  WebSocket  direct link on the same WiFi network (fast, low delay)
 
 Run with:
     streamlit run app.py
@@ -16,19 +21,23 @@ Run with:
 """
 
 import base64
+import json
 from datetime import datetime
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-from serial_bridge import SerialBridge, SimulationBridge
+from websocket_bridge import WebSocketBridge
 from cloud_bridge import CloudBridge
 
 # --------------------------------------------------------------------------
 # Saved settings - edit here once, never type it again
 # --------------------------------------------------------------------------
 DEFAULT_FIREBASE_URL = "https://maize-sorting-default-rtdb.firebaseio.com/"
+DEFAULT_PI_HOST = "raspberrypi.local"   # the Pi's hostname or IP address
+DEFAULT_WS_PORT = 8765                  # must match WS_PORT in sorter_agent.py
+DEFAULT_WS_KEY = "seedsorter"           # must match WS_ACCESS_KEY in sorter_agent.py
 
 # --------------------------------------------------------------------------
 # Page setup
@@ -41,8 +50,7 @@ st.set_page_config(
 
 MODE_OPTIONS = [
     "Cloud (WiFi - check from anywhere)",
-    "Live (Raspberry Pi over USB)",
-    "Simulation (no hardware)",
+    "WebSocket (same WiFi - fastest)",
 ]
 
 SERVO_AUTO = "Autonomous"
@@ -50,7 +58,7 @@ SERVO_MANUAL = "Manual"
 
 if "bridge" not in st.session_state:
     st.session_state.bridge = None
-if "mode" not in st.session_state:
+if "mode" not in st.session_state or st.session_state.mode not in MODE_OPTIONS:
     st.session_state.mode = MODE_OPTIONS[0]
 if "servo_mode" not in st.session_state:
     st.session_state.servo_mode = SERVO_AUTO
@@ -62,6 +70,8 @@ if "active_session" not in st.session_state:
     st.session_state.active_session = None
 if "last_run_series" not in st.session_state:
     st.session_state.last_run_series = []
+if "wifi_msg" not in st.session_state:
+    st.session_state.wifi_msg = None
 
 # ---- dark palette ----
 BG = "#0B1120"          # page background
@@ -483,6 +493,48 @@ def end_active_session(good: int, bad: int):
     st.session_state.live_series = []
 
 
+def send_wifi_credentials():
+    """Button callback: send the typed SSID/password to the Pi as a WIFI command.
+
+    The password is cleared from the form right after sending and is never stored
+    anywhere else by the dashboard.
+    """
+    ssid = (st.session_state.get("wifi_ssid") or "").strip()
+    password = st.session_state.get("wifi_pass") or ""
+    bridge = st.session_state.bridge
+    if bridge is None:
+        msg = ("error", "Connect to the Pi first (Cloud or WebSocket), then send the WiFi details.")
+    elif not ssid:
+        msg = ("error", "Enter the WiFi name (SSID).")
+    elif len(ssid.encode("utf-8")) > 32:
+        msg = ("error", "A WiFi name can be at most 32 bytes long.")
+    elif password and not 8 <= len(password) <= 63:
+        msg = ("error", "A WPA/WPA2 password must be 8 to 63 characters (leave empty for an open network).")
+    else:
+        payload = base64.b64encode(
+            json.dumps({"ssid": ssid, "password": password}).encode("utf-8")
+        ).decode("ascii")
+        if bridge.send_command("WIFI:" + payload):
+            msg = ("success", f"Sent. The Pi is joining '{ssid}'. Watch the status below.")
+            st.session_state.wifi_pass = ""
+        else:
+            msg = ("error", "Could not send the WiFi details. Check the connection.")
+    st.session_state.wifi_msg = msg
+
+
+@st.fragment(run_every=2)
+def pi_network_status():
+    """Shows what the Pi reports about its WiFi (refreshes without a full rerun)."""
+    b = st.session_state.bridge
+    if b is None:
+        return
+    snap = b.get_snapshot()
+    if snap.get("wifi"):
+        st.caption(f"Pi WiFi: {snap['wifi']}")
+    if snap.get("pi_ip"):
+        st.caption(f"Pi address: `{snap['pi_ip']}`")
+
+
 # --------------------------------------------------------------------------
 # Sidebar - connection settings
 # --------------------------------------------------------------------------
@@ -492,17 +544,22 @@ with st.sidebar:
     mode = st.radio(
         "Mode", MODE_OPTIONS, index=MODE_OPTIONS.index(st.session_state.mode),
         help="Cloud: Pi + dashboard talk over the internet via Firebase.\n"
-             "Live: wired by USB, same computer.\nSimulation: demo with fake data.",
+             "WebSocket: direct link, needs this computer and the Pi on the same WiFi. "
+             "Much lower delay.",
     )
     st.session_state.mode = mode
 
-    port, baud = None, None
     db_url = DEFAULT_FIREBASE_URL
-    if mode.startswith("Live"):
-        port = st.text_input("Serial port", value="COM3",
-                             help="e.g. COM3 on Windows, /dev/ttyACM0 on Linux/Pi.")
-        baud = st.number_input("Baud rate", value=9600, step=1)
-    elif mode.startswith("Cloud"):
+    ws_host, ws_port, ws_key = DEFAULT_PI_HOST, DEFAULT_WS_PORT, DEFAULT_WS_KEY
+    if mode.startswith("WebSocket"):
+        ws_host = st.text_input("Pi address", value=DEFAULT_PI_HOST, key="ws_host",
+                                help="Hostname or IP of the Raspberry Pi, e.g. raspberrypi.local "
+                                     "or 192.168.1.50. In Cloud mode the Pi reports its IP below.")
+        ws_key = st.text_input("Access key", value=DEFAULT_WS_KEY, type="password", key="ws_key",
+                               help="Must match WS_ACCESS_KEY in sorter_agent.py.")
+        with st.expander("Advanced", expanded=False):
+            ws_port = st.number_input("Port", value=DEFAULT_WS_PORT, step=1, key="ws_port")
+    else:
         # Pre-filled and saved in the code — only open this to point at another database.
         with st.expander("Firebase database", expanded=False):
             db_url = st.text_input("Database URL", value=DEFAULT_FIREBASE_URL,
@@ -515,16 +572,18 @@ with st.sidebar:
         if st.button("Connect", use_container_width=True, type="primary", icon=":material/power:"):
             if st.session_state.bridge:
                 st.session_state.bridge.disconnect()
+            st.session_state.bridge = None
             bridge = None
-            if mode.startswith("Live"):
-                bridge = SerialBridge(port, int(baud))
-            elif mode.startswith("Cloud"):
+            if mode.startswith("WebSocket"):
+                if not ws_host.strip():
+                    st.error("Enter the Pi address.")
+                else:
+                    bridge = WebSocketBridge(ws_host.strip(), int(ws_port), ws_key)
+            else:
                 clean_url = db_url.strip().rstrip("/") if db_url else ""
                 bridge = CloudBridge(clean_url) if clean_url else None
                 if bridge is None:
                     st.error("Firebase URL is empty.")
-            else:
-                bridge = SimulationBridge()
             if bridge is not None:
                 bridge.connect()
                 st.session_state.bridge = bridge
@@ -545,6 +604,24 @@ with st.sidebar:
         else:
             st.error(f"Connection failed: {snap.get('error') or 'unknown error'}")
 
+    # ---------- Pi WiFi setup ----------
+    st.divider()
+    with st.expander("Pi WiFi setup", expanded=False):
+        st.caption(
+            "Tell the Pi which WiFi network to join, so the dashboard can reach it over "
+            "WebSocket. Connect in Cloud mode first if the Pi is on a different network. "
+            "Use the same network your ESP8266 is on, and put this computer on it too."
+        )
+        st.text_input("WiFi name (SSID)", key="wifi_ssid")
+        st.text_input("WiFi password", type="password", key="wifi_pass")
+        st.button("Send WiFi to Pi", use_container_width=True, key="wifi_send",
+                  on_click=send_wifi_credentials, icon=":material/wifi:")
+        _wm = st.session_state.wifi_msg
+        if _wm:
+            getattr(st, _wm[0])(_wm[1])
+        pi_network_status()
+        st.caption("Only works while the machine is Idle. The password is not stored by the dashboard.")
+
     st.divider()
     show_camera = st.checkbox("Show camera feed", value=True)
 
@@ -558,14 +635,16 @@ with st.sidebar:
 
     with st.expander("Protocol reference"):
         st.caption(
-            "**USB protocol** — in: `0`/`1` (bad/good, per-seed) · `GOOD`/`BAD` · "
-            "`COUNTS:<g>,<b>` · `STATUS:IDLE/RUNNING/CALIBRATION/FAULT` · "
-            "`DIVERTER:READY/DIVERTING` — out: `START`/`STOP`/`CALIBRATE`/"
-            "`SPD1`/`SPD2`/`SPD3`/`AUTO`/`MANUAL`/"
-            "`SERVO50`/`SERVO100`/`SERVO150`/`SERVO180`/`SERVO<0-180>`\n\n"
+            "**WebSocket protocol** — `ws://<pi>:8765`. First message: "
+            "`{\"type\":\"auth\",\"key\":...}`. Pi sends JSON `status` messages and "
+            "binary JPEG frames. Dashboard sends `{\"type\":\"cmd\",\"cmd\":...}`.\n\n"
             "**Cloud protocol** — Firebase keys: `good`, `bad` (running totals), "
             "`status` (Idle/Running/Calibration/Fault), `diverter` (Ready/Diverting), "
             "`camera_frame`, `command`.\n\n"
+            "**Commands (both modes)** — `START`/`STOP`/`CALIBRATE`/"
+            "`SPD1`/`SPD2`/`SPD3`/`AUTO`/`MANUAL`/"
+            "`SERVO50`/`SERVO100`/`SERVO150`/`SERVO180`/`SERVO<0-180>`/"
+            "`WIFI:<base64 json>`\n\n"
             "**Servo modes** — `AUTO`: gate follows the vision classifier. "
             "`MANUAL`: gate only moves on `SERVO<angle>` commands from this dashboard.\n\n"
             "**Speed levels** — 3.75 / 6.2 / 7.4 cm/s (level 1 is measured; "
